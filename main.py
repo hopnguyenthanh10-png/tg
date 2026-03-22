@@ -39,6 +39,7 @@ CONFIG = {
     "fee_min": 5000,
     "fee_percent": 0.01,
     "app_url": os.environ.get("APP_URL", "https://your-app-name.onrender.com"), # Cần điền URL Render vào env
+    "log_channel": "@kiemtienonline48h", # === TÍNH NĂNG MỚI: Kênh thông báo GD thành công ===
     "aml_note": "⚠️ <b>LƯU Ý:</b> Hệ thống nghiêm cấm hành vi rửa tiền. Mọi nguồn tiền bẩn, tiền vi phạm pháp luật nếu bị phát hiện sẽ bị phong tỏa vĩnh viễn và cung cấp thông tin cho cơ quan chức năng."
 }
 
@@ -72,6 +73,12 @@ class Database:
                 seller_name TEXT, amount INTEGER, fee INTEGER, total_pay INTEGER,
                 product_name TEXT, seller_bank_info TEXT, status TEXT, 
                 qr_msg_id INTEGER, status_msg_id INTEGER, created_at TEXT)''')
+            
+            # === TÍNH NĂNG MỚI: BẢNG DỮ LIỆU NÂNG CẤP ===
+            self.conn.execute('''CREATE TABLE IF NOT EXISTS blacklist (
+                user_id INTEGER PRIMARY KEY, reason TEXT, created_at TEXT)''')
+            self.conn.execute('''CREATE TABLE IF NOT EXISTS bot_groups (
+                chat_id INTEGER PRIMARY KEY, chat_name TEXT)''')
 
     def create_trade(self, data):
         with self.conn:
@@ -100,6 +107,34 @@ class Database:
                 SUM(fee) as total_fee 
                 FROM trades WHERE status = ?""", (Status.COMPLETED,)).fetchone()
             return res
+
+    # === TÍNH NĂNG MỚI: QUẢN LÝ DATABASE NÂNG CẤP ===
+    def add_blacklist(self, user_id, reason):
+        with self.conn:
+            self.conn.execute("INSERT OR REPLACE INTO blacklist (user_id, reason, created_at) VALUES (?, ?, ?)", 
+                              (user_id, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+
+    def remove_blacklist(self, user_id):
+        with self.conn:
+            self.conn.execute("DELETE FROM blacklist WHERE user_id = ?", (user_id,))
+
+    def is_blacklisted(self, user_id):
+        res = self.conn.execute("SELECT reason FROM blacklist WHERE user_id = ?", (user_id,)).fetchone()
+        return res['reason'] if res else None
+
+    def add_group(self, chat_id, chat_name):
+        with self.conn:
+            self.conn.execute("INSERT OR IGNORE INTO bot_groups (chat_id, chat_name) VALUES (?, ?)", (chat_id, chat_name))
+
+    def get_all_groups(self):
+        return self.conn.execute("SELECT chat_id FROM bot_groups").fetchall()
+
+    def get_top_buyers(self):
+        return self.conn.execute("""
+            SELECT buyer_name, COUNT(*) as count, SUM(amount) as total 
+            FROM trades WHERE status = ? 
+            GROUP BY buyer_id ORDER BY total DESC LIMIT 5
+        """, (Status.COMPLETED,)).fetchall()
 
 db = Database()
 app = FastAPI()
@@ -195,6 +230,10 @@ async def process_paid_invoice(code, amount_received):
 #                      INTERFACE & COMMANDS
 # ==========================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # === TÍNH NĂNG MỚI: Tự động lưu Group để sau này Broadcast ===
+    if update.effective_chat.type in ["group", "supergroup"]:
+        db.add_group(update.effective_chat.id, update.effective_chat.title)
+
     bot_info = await context.bot.get_me()
     keyboard = [
         [InlineKeyboardButton("➕ Thêm Bot Vào Nhóm", url=f"https://t.me/{bot_info.username}?startgroup=true")],
@@ -222,6 +261,14 @@ async def cmd_taogdtg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
         return await update.message.reply_text("❌ Lệnh này chỉ dùng trong Nhóm Giao Dịch!")
     
+    # === TÍNH NĂNG MỚI: Tự động lưu thông tin Group ===
+    db.add_group(update.effective_chat.id, update.effective_chat.title)
+
+    # === TÍNH NĂNG MỚI: Kiểm tra Blacklist Anti-Scam ===
+    ban_reason = db.is_blacklisted(update.effective_user.id)
+    if ban_reason:
+        return await update.message.reply_text(f"⛔ <b>TÀI KHOẢN BỊ KHÓA</b>\nBạn nằm trong danh sách đen của hệ thống.\nLý do: <i>{ban_reason}</i>", parse_mode=ParseMode.HTML)
+
     try:
         parts = [p.strip() for p in update.message.text.replace("/taogdtg", "").split("|")]
         if len(parts) < 3: raise ValueError
@@ -288,9 +335,7 @@ async def cmd_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"❌ Trạng thái đơn không hợp lệ để rút tiền! (Hiện tại: {trade['status']})")
 
-# ĐÃ SỬA: LỆNH HOÀN TIỀN (YÊU CẦU LÝ DO & HÌNH ẢNH)
 async def cmd_hoantien(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Kiểm tra xem người dùng có gửi kèm ảnh không
     if not update.message.photo:
         return await update.message.reply_text(
             "❌ <b>Yêu cầu hoàn tiền thất bại!</b>\nBạn bắt buộc phải gửi hình ảnh làm bằng chứng tranh chấp.\n\n"
@@ -299,7 +344,6 @@ async def cmd_hoantien(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
     
-    # Lấy caption thay vì text
     caption = update.message.caption or ""
     parts = caption.split()
     
@@ -315,7 +359,6 @@ async def cmd_hoantien(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not trade:
         return await update.message.reply_text("❌ Đơn không tồn tại!")
 
-    # Chỉ cho phép Buyer hoặc Admin yêu cầu hoàn tiền khi đơn đang HOLDING hoặc BUYER_DONE
     is_admin = update.effective_user.id == CONFIG['admin_id']
     is_buyer = update.effective_user.id == trade['buyer_id']
     
@@ -325,7 +368,6 @@ async def cmd_hoantien(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if trade['status'] in [Status.HOLDING, Status.BUYER_DONE, Status.PAYOUT_WAIT]:
         db.update_trade(code, status=Status.REFUND_WAIT, seller_bank_info=info)
         
-        # Bổ sung nút Từ Chối Hoàn Tiền cho Admin
         kb = [
             [InlineKeyboardButton("🔄 DUYỆT HOÀN TIỀN", callback_data=f"adminrefund_{code}")],
             [InlineKeyboardButton("❌ TỪ CHỐI & GIỮ TIỀN", callback_data=f"rejectrefund_{code}")]
@@ -340,7 +382,6 @@ async def cmd_hoantien(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📂 <b>Nhóm GD:</b> {trade['group_name']}
 📸 <i>Bằng chứng được đính kèm bên trên.</i>"""
         
-        # Gửi ảnh bằng chứng cho Admin
         await context.bot.send_photo(
             chat_id=CONFIG['admin_id'], 
             photo=update.message.photo[-1].file_id, 
@@ -397,7 +438,6 @@ async def cmd_thongke(update: Update, context: ContextTypes.DEFAULT_TYPE):
 💎 <b>Phí thu được:</b> {s['total_fee'] or 0:,} VND"""
     await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
 
-# TÍNH NĂNG MỚI: LỊCH SỬ GIAO DỊCH
 async def cmd_lichsu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     curr_user = f"@{update.effective_user.username}"
@@ -417,7 +457,6 @@ async def cmd_lichsu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
 
-# TÍNH NĂNG MỚI: LIÊN HỆ CSKH
 async def cmd_cskh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = f"""🎧 <b>HỖ TRỢ KHÁCH HÀNG 24/7</b>
 ━━━━━━━━━━━━━━━━━━━━
@@ -428,6 +467,65 @@ Nếu bạn gặp vấn đề với giao dịch, nạp sai tiền, hoặc có kh
 <i>Lưu ý: Để được hỗ trợ nhanh nhất, vui lòng cung cấp kèm [Mã GD] và [Hình ảnh bill/bằng chứng] khi nhắn tin cho Admin.</i>"""
     await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
 
+# ==========================================================
+#         TÍNH NĂNG NÂNG CẤP LÊN TẦM CAO MỚI (ADD-ONS)
+# ==========================================================
+async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bảng xếp hạng mức độ uy tín"""
+    top_users = db.get_top_buyers()
+    if not top_users:
+        return await update.message.reply_text("📊 Hệ thống chưa có đủ dữ liệu để xếp hạng.")
+    
+    txt = "🏆 <b>BẢNG XẾP HẠNG KHÁCH HÀNG VIP (THEO VOLUME)</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+    medals = ["🥇", "🥈", "🥉", "🏅", "🎖"]
+    for i, user in enumerate(top_users):
+        txt += f"{medals[i]} <b>{user['buyer_name']}</b>\n└ <i>{user['count']} giao dịch</i> | 💰 <b>{user['total']:,} VND</b>\n\n"
+    
+    await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin chặn kẻ lừa đảo"""
+    if update.effective_user.id != CONFIG['admin_id']: return
+    if len(context.args) < 2:
+        return await update.message.reply_text("❌ Cú pháp: <code>/ban [User_ID] [Lý do]</code>", parse_mode=ParseMode.HTML)
+    
+    target_id = int(context.args[0])
+    reason = " ".join(context.args[1:])
+    db.add_blacklist(target_id, reason)
+    await update.message.reply_text(f"🛑 Đã cho <b>{target_id}</b> vào sổ đen.\nLý do: <i>{reason}</i>", parse_mode=ParseMode.HTML)
+
+async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin mở khóa"""
+    if update.effective_user.id != CONFIG['admin_id']: return
+    if not context.args:
+        return await update.message.reply_text("❌ Cú pháp: <code>/unban [User_ID]</code>", parse_mode=ParseMode.HTML)
+    
+    target_id = int(context.args[0])
+    db.remove_blacklist(target_id)
+    await update.message.reply_text(f"✅ Đã gỡ Blacklist cho ID: <b>{target_id}</b>", parse_mode=ParseMode.HTML)
+
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Phát sóng tin nhắn tới mọi Group bot đang có mặt (Tính năng Kéo Mem)"""
+    if update.effective_user.id != CONFIG['admin_id']: return
+    if not context.args:
+        return await update.message.reply_text("❌ Cú pháp: <code>/broadcast [Nội dung thông báo]</code>", parse_mode=ParseMode.HTML)
+    
+    msg = update.message.text.replace("/broadcast", "").strip()
+    groups = db.get_all_groups()
+    success = 0
+    
+    for g in groups:
+        try:
+            await context.bot.send_message(g['chat_id'], f"📢 <b>THÔNG BÁO TỪ HỆ THỐNG:</b>\n━━━━━━━━━━━━━━━━━━━━\n{msg}", parse_mode=ParseMode.HTML)
+            success += 1
+            await asyncio.sleep(0.5) # Tránh bị Telegram Rate Limit
+        except: pass
+        
+    await update.message.reply_text(f"🚀 <b>Broadcast hoàn tất!</b>\nĐã gửi thành công tới {success}/{len(groups)} nhóm.", parse_mode=ParseMode.HTML)
+
+# ==========================================================
+#                      CALLBACKS
+# ==========================================================
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -482,7 +580,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.answer("⚠️ Trạng thái đơn không hợp lệ!", show_alert=True)
 
-    # ĐÃ SỬA: CHỈ DÀNH CHO DUYỆT RÚT TIỀN CỦA SELLER
     elif data.startswith("adminpayout_"):
         if user_id != CONFIG['admin_id']: return await query.answer("⛔ Bạn không có quyền!", show_alert=True)
         code = data.split("_")[1]
@@ -496,10 +593,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else: await query.edit_message_text(text=txt_admin, parse_mode=ParseMode.HTML)
             
             await context.bot.send_message(trade['group_id'], f"<b>✅ GIẢI NGÂN THÀNH CÔNG: Giao dịch {code}</b>\nAdmin đã chuyển tiền cho người bán {trade['seller_name']}. Cảm ơn các bạn đã sử dụng dịch vụ!", parse_mode=ParseMode.HTML)
+            
+            # === TÍNH NĂNG MỚI: Log các đơn thành công ra Channel Truyền Thông ===
+            if CONFIG.get("log_channel"):
+                log_txt = f"""🎉 <b>GIAO DỊCH THÀNH CÔNG</b> 🎉
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>Sản phẩm:</b> {trade['product_name']}
+💵 <b>Trị giá:</b> {trade['amount']:,} VND
+🤝 <b>Bên bán:</b> {trade['seller_name']}
+
+🛡 <i>Giao dịch trung gian uy tín, tự động 100% qua Bot!</i>"""
+                try: await context.bot.send_message(CONFIG["log_channel"], log_txt, parse_mode=ParseMode.HTML)
+                except Exception as e: logger.error(f"Lỗi gửi log channel: {e}")
+                
         else:
             await query.answer("⚠️ Đơn không ở trạng thái chờ rút tiền!", show_alert=True)
 
-    # ĐÃ SỬA: CHỈ DÀNH CHO HOÀN TIỀN CỦA BUYER
     elif data.startswith("adminrefund_"):
         if user_id != CONFIG['admin_id']: return await query.answer("⛔ Bạn không có quyền!", show_alert=True)
         code = data.split("_")[1]
@@ -516,13 +625,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.answer("⚠️ Đơn này không ở trạng thái chờ hoàn tiền!", show_alert=True)
 
-    # TÍNH NĂNG MỚI: TỪ CHỐI HOÀN TIỀN
     elif data.startswith("rejectrefund_"):
         if user_id != CONFIG['admin_id']: return await query.answer("⛔ Bạn không có quyền!", show_alert=True)
         code = data.split("_")[1]
         trade = db.get_trade(code)
         if trade['status'] == Status.REFUND_WAIT:
-            db.update_trade(code, status=Status.HOLDING) # Đưa trạng thái về lại đang giữ tiền
+            db.update_trade(code, status=Status.HOLDING) 
             await query.answer("✅ Đã từ chối hoàn tiền!")
             
             txt_admin = f"❌ <b>ĐÃ TỪ CHỐI YÊU CẦU HOÀN TIỀN ĐƠN {code}</b>"
@@ -545,8 +653,15 @@ async def main_runner():
     tg_app.add_handler(CommandHandler("check", cmd_check))
     tg_app.add_handler(CommandHandler("huy", cmd_huy))
     tg_app.add_handler(CommandHandler("thongke", cmd_thongke))
-    tg_app.add_handler(CommandHandler("lichsu", cmd_lichsu)) # Handler mới
-    tg_app.add_handler(CommandHandler("cskh", cmd_cskh))     # Handler mới
+    tg_app.add_handler(CommandHandler("lichsu", cmd_lichsu)) 
+    tg_app.add_handler(CommandHandler("cskh", cmd_cskh))     
+    
+    # === ĐĂNG KÝ HANDLER NÂNG CẤP ===
+    tg_app.add_handler(CommandHandler("top", cmd_top))
+    tg_app.add_handler(CommandHandler("ban", cmd_ban))
+    tg_app.add_handler(CommandHandler("unban", cmd_unban))
+    tg_app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+
     tg_app.add_handler(CallbackQueryHandler(callback_handler))
     
     # Khởi tạo bot
